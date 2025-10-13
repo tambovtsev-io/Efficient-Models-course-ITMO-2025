@@ -267,7 +267,3 @@ def backward_dx_int8_fused(dy: torch.Tensor,
 ---
 
 
-* [ ] Outputs have correct dtypes and shapes
-* [ ] Passes public tests (or as many as possible)
-
-Good luck and have fun with Triton! 🚀
