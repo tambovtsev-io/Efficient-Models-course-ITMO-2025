@@ -1,281 +1,273 @@
-# Homework 4 — Quantized Linear in Triton (Oct 20 → Nov 10)
+# HW4 — Triton INT8 (Quantization & MatMul)
 
-**Timeline:** three weeks — **Oct 20** to **Nov 10**  
-**Goal:** implement an INT8 *quantized* linear layer with Triton:
-- symmetric linear quantization to int8 with a Triton,
-- **forward** in int8 with a Triton matmul that **fuses dequantization**,
-- **backward** (grad w.r.t. input, weight, bias) implemented in Triton,
+This homework asks you to implement several **Triton** GPU kernels for INT8 quantization and matrix ops with fused dequantization. Submissions are validated by automated tests and scored per test.
 
----
+> **Deadline (MSK):** **10 Nov 2025, 23:59 (UTC+3)**
 
-## What you will build
 
-Implement a custom autograd op and module:
+## Task List
+
+### 10) `10_quantize_global_int8` — Global INT8 Quantization (Triton) — **2.0 pts, up to 50 attempts**
+
+**Goal**: Global (per-tensor) **symmetric** quantization of input tensor `X` into `int8`.
+
+**Return**: `(Q: int8, absmax: scalar same dtype as X)`.
+
+**Math**
+
+* `absmax = max(|X|)`
+* `Q = round(127.0 * (X / absmax))` written as `int8`
+
+**Kernel**
+
+* Single pass over the linear buffer with tail masking.
+* Use `tl.load` / `tl.store`.
+* **Autotune** with at least 2 configs.
+
+**Allowed imports**: `torch`, `triton`, `triton.language`.
+
+**Signature skeleton**
 
 ```python
 import torch
 import triton
 import triton.language as tl
 
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_SIZE": 1024}, num_warps=4),
+        triton.Config({"BLOCK_SIZE": 2048}, num_stages=1),
+    ],
+    key=["n_elements"],
+)
 @triton.jit
-def _quantize_global_triton(
-    fp_ptr,               # *const* pointer to input FP tensor data, row-major
-                          #   dtype: fp16/fp32 supported by tl.load
-                          #   shape: (N_ROWS, N_COLS)
-    q_ptr,                # pointer to output INT8 tensor (same shape as fp_ptr)
-                          #   dtype: int8
-    scale_out_ptr,        # pointer to single fp32 scale value to be written:
-                          #   scale_out_ptr[0] = max(abs(fp_ptr)) / 127  (clamped >= 1e-8)
-    N_ROWS,               # int: number of rows in the 2D matrix
-    N_COLS: tl.constexpr  # constexpr int: number of columns in the 2D matrix
-):
-    """
-    Symmetric per-tensor quantization (zero-point = 0).
-
-    Contract:
-      - Let s = max(|X|)/127 (X is the full tensor), clamped to >= 1e-8.
-      - For every element: Q = clamp(round(X / s), -127, 127).to(int8).
-      - Write s to scale_out_ptr[0] (fp32).
-      - X layout is row-major (index = row * N_COLS + col).
-    """
-
-    raise NotImplementedError
+def _quantize_global(x_ptr, absmax_inv_ptr, output_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+    # YOUR CODE HERE
 
 
-@triton.jit
-def _quantize_rowwise_triton(
-    fp_ptr,            # *const* pointer to input FP tensor data, row-major
-                       #   dtype: fp16/fp32 supported by tl.load
-                       #   shape: (N_ROWS, N_COLS)
-    q_ptr,             # pointer to output INT8 tensor (same shape as fp_ptr)
-                       #   dtype: int8
-    scale_row_ptr,     # pointer to row-wise scales (fp32) of shape (N_ROWS,)
-                       #   scale_row_ptr[row] = max(abs(fp_ptr[row, :])) / 127
-    N_ROWS,            # int: number of rows
-    N_COLS: tl.constexpr  # constexpr int: number of columns
-):
-    """
-    Symmetric per-row quantization (zero-point = 0).
-
-    Typical usage for weights:
-      - To get per-OUT-channel scales for (IN, OUT) weights, quantize W^T as (OUT, IN)
-        so each OUT-channel becomes a row.
-
-    Contract for each row r:
-      - s_r = max(|X[r, :]|)/127 (clamped to >= 1e-8)
-      - Q[r, c] = clamp(round(X[r, c]/s_r), -127, 127).to(int8)
-      - Write s_r to scale_row_ptr[r] (fp32).
-    """
-
-    raise NotImplementedError
-
-
-@triton.jit
-def _forward_triton(
-    x_q_ptr,           # pointer to int8 input activations X_q, shape (B, IN), row-major
-                       #   dtype: int8
-    x_scale_ptr,       # pointer to scalar fp32 scale for X (per-tensor):
-                       #   x_scale_ptr[0] = s_x
-    w_q_ptr,           # pointer to int8 weights W_q, shape (IN, OUT), row-major
-                       #   dtype: int8
-    w_scale_ptr,       # pointer to fp32 scales for W:
-                       #   if PER_CHANNEL==1: shape (OUT,) per-output-channel scales s_w[j]
-                       #   else (PER_CHANNEL==0): scalar s_w at w_scale_ptr[0]
-    b_ptr,             # pointer to optional bias (fp16) shape (OUT,), or 0 if no bias
-    y_ptr,             # pointer to output activations Y (fp16), shape (B, OUT), row-major
-    B,                 # int: batch size (rows of X / Y)
-    IN,                # int: input features (K dimension)
-    OUT,               # int: output features (N dimension)
-    BLOCK_M: tl.constexpr,  # tile size along M=B
-    BLOCK_N: tl.constexpr,  # tile size along N=OUT
-    BLOCK_K: tl.constexpr,  # tile size along K=IN
-    PER_CHANNEL: tl.constexpr  # 1 if per-OUT-channel scales for W, else 0 (per-tensor)
-):
-    """
-    Computes:
-      Y = dequant(X_q) @ dequant(W_q) + bias, with fusion of dequantization into GEMM.
-
-    Math:
-      - int32 accumulator: ACC = Σ_k int(X_q) * int(W_q)
-      - scale per output column j: scale_j = s_x * (s_w[j] if PER_CHANNEL else s_w)
-      - Y[:, j] = (ACC[:, j].to(fp32) * scale_j).to(fp16) + bias[j] (if present)
-
-    Layouts:
-      - X_q: row-major (B, IN)
-      - W_q: row-major (IN, OUT)
-      - Y:   row-major (B, OUT)
-
-    Notes:
-      - Use masking for edge tiles.
-      - Load int8 tiles, cast to int32 for dot.
-      - Apply scales only once after K-loop (fused dequant).
-      - Add bias inside the kernel for best fusion.
-    """
-
-    raise NotImplementedError
-
-@triton.jit
-def _backward_dx_triton(
-    dy_ptr,            # pointer to upstream grad dY (fp16), shape (B, OUT), row-major
-    w_q_ptr,           # pointer to int8 weights W_q, shape (IN, OUT), row-major
-    w_scale_ptr,       # pointer to scales for W (fp32):
-                       #   if PER_CHANNEL==1: (OUT,) per-output-channel
-                       #   else (scalar at w_scale_ptr[0])
-    dx_ptr,            # pointer to output grad dX (fp16), shape (B, IN), row-major
-    B,                 # int: batch size
-    IN,                # int: input features
-    OUT,               # int: output features
-    BLOCK_M: tl.constexpr,  # tile size along M=B
-    BLOCK_N: tl.constexpr,  # tile size along N=IN
-    BLOCK_K: tl.constexpr,  # tile size along K=OUT
-    PER_CHANNEL: tl.constexpr  # 1: per-OUT scales, 0: scalar scale
-):
-    """
-    Computes:
-      dX = dY @ (dequant(W_q))^T
-
-    Math:
-      - W_deq = W_q.to(fp32) * (s_w[j] per column j OR scalar s_w)
-      - dX = dY (B, OUT) @ W_deq^T (OUT, IN) → (B, IN)
-
-    Requirements:
-      - Stream tiles of dY and W_q^T.
-      - On-the-fly dequant of W_q tiles (multiply by s_w or s_w[j]).
-      - Accumulate in fp32, store fp16 to dx_ptr.
-    """
-
-    raise NotImplementedError
-
-
-@triton.jit
-def _backward_dw_triton(
-    x_q_ptr,           # pointer to int8 inputs X_q, shape (B, IN), row-major
-    x_scale_ptr,       # pointer to scalar fp32 scale: x_scale_ptr[0] = s_x
-    dy_ptr,            # pointer to upstream grad dY (fp16), shape (B, OUT), row-major
-    dw_ptr,            # pointer to output grad dW (fp16), shape (IN, OUT), row-major
-    B,                 # int: batch size
-    IN,                # int: input features
-    OUT,               # int: output features
-    BLOCK_M: tl.constexpr,  # tile size along M=IN
-    BLOCK_N: tl.constexpr,  # tile size along N=OUT
-    BLOCK_K: tl.constexpr   # tile size along K=B
-):
-    """
-    Computes:
-      dW = (dequant(X_q))^T @ dY
-
-    Math:
-      - X_deq = X_q.to(fp32) * s_x (scalar per-tensor scale)
-      - dW = X_deq^T (IN, B) @ dY (B, OUT) → (IN, OUT)
-
-    Requirements:
-      - Stream tiles of X_q^T and dY.
-      - On-the-fly dequant of X_q tiles (multiply by s_x).
-      - Accumulate in fp32, store fp16 to dw_ptr.
-    """
-
-    raise NotImplementedError
-
-
-@triton.jit
-def _backward_db_triton(
-    dy_ptr,            # pointer to upstream grad dY (fp16), shape (B, OUT), row-major
-    db_ptr,            # pointer to output grad dB (fp16), shape (OUT,)
-    B,                 # int: batch size
-    OUT,               # int: output features
-    BLOCK_N: tl.constexpr,  # tile size along N=OUT
-    BLOCK_M: tl.constexpr   # tile size along M=B (reduction chunk)
-):
-    """
-    Computes:
-      dB = sum(dY, dim=0)  → shape (OUT,)
-
-    Requirements:
-      - Reduce along batch dimension in chunks of BLOCK_M.
-      - Accumulate in fp32, store fp16 to db_ptr.
-      - Use masking for tail tiles along both dimensions.
-    """
-
-    raise NotImplementedError
-
-class CustomLinearFunction(torch.autograd.Function):
-    @staticmethod
-    def forward(
-        ctx,
-        x_fp16,          # torch.Tensor, CUDA, dtype=torch.float16, shape (B, IN)
-        w_fp16,          # torch.Tensor, CUDA, dtype=torch.float16, shape (IN, OUT)
-        b_fp16=None,     # Optional[torch.Tensor], CUDA, dtype=torch.float16, shape (OUT,)
-        *,
-        per_channel=True # bool: if True — per-OUT-channel quant for W; else per-tensor
-    ):
-        """
-        Returns:
-          y_fp16: torch.Tensor, CUDA, dtype=torch.float16, shape (B, OUT)
-
-        Must:
-          - Quantize X per-tensor in Triton → (x_q:int8, s_x:fp32 scalar)
-          - Quantize W per-OUT-channel (if per_channel) or per-tensor (if not) in Triton
-            → (w_q:int8, s_w: fp32 scalar or fp32 (OUT,))
-          - Call _forward_triton to compute Y with fused dequant & optional bias
-          - Save (x_q, x_scale, w_q, w_scale, b or None) + shape/per_channel in ctx for backward
-        """
-        raise NotImplementedError
-
-    @staticmethod
-    def backward(ctx, dy):
-        """
-        Args:
-          dy: torch.Tensor, CUDA, dtype=torch.float16, shape (B, OUT)
-
-        Returns:
-          dx: torch.Tensor, CUDA, dtype=torch.float16, shape (B, IN)
-          dw: torch.Tensor, CUDA, dtype=torch.float16, shape (IN, OUT)
-          db: Optional[torch.Tensor], CUDA, dtype=torch.float16, shape (OUT,) or None
-          None (for per_channel kwarg)
-
-        Must:
-          - Use _backward_dx_triton (with on-the-fly dequant of W_q)
-          - Use _backward_dw_triton (with on-the-fly dequant of X_q)
-          - Use _backward_db_triton for bias reduction if bias was present
-        """
-        raise NotImplementedError
-
-
-class QuantizedLinear(torch.nn.Module):
-    def __init__(
-        self,
-        in_features,     # int: number of input features (IN)
-        out_features,    # int: number of output features (OUT)
-        bias=True,       # bool: whether to include bias parameter (shape OUT)
-        *,
-        per_channel=True # bool: whether to use per-OUT-channel quantization for W
-    ):
-        """
-        Buffers/Parameters to create:
-          - self.weight: torch.nn.Parameter, shape (IN, OUT), dtype fp16, CUDA
-          - self.bias:   Optional[torch.nn.Parameter], shape (OUT,), dtype fp16, CUDA
-          - store flags: self.in_features, self.out_features, self.per_channel
-
-        Init tips:
-          - torch.nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
-          - if bias: uniform_(-1/sqrt(IN), 1/sqrt(IN))
-        """
-        super().__init__()
-        raise NotImplementedError
-
-    def forward(self, x):
-        """
-        Args:
-          x: torch.Tensor, CUDA, dtype=torch.float16, shape (B, IN)
-
-        Returns:
-          y: torch.Tensor, CUDA, dtype=torch.float16, shape (B, OUT)
-
-        Must:
-          return CustomLinearFunction.apply(x, self.weight, self.bias, per_channel=self.per_channel)
-        """
-        raise NotImplementedError
-
-
-        
+def quantize_global(x: torch.Tensor):
+    # YOUR CODE HERE
 ```
+
+---
+
+### 11) `11_quantize_rowwise_int8` — Rowwise INT8 Quantization (Triton) — **3.0 pts, up to 50 attempts**
+
+**Goal**: Per-row symmetric quantization for a 2D tensor `X[N_ROWS, N_COLS]` (row-major, contiguous; fp16/fp32 on CUDA).
+
+**Return**: `(Q: int8[N_ROWS, N_COLS], absmaxs: fp16[N_ROWS])`.
+
+**Math** (for each row `r`)
+
+* `a_r = max_c |X[r, c]|`
+* `Q[r, c] = round(127.0 * X[r, c] / a_r)` written as `int8`
+
+**Kernel**
+
+* **One program block per row**.
+* Extend the row width to the next power-of-two `P2` (mask the tail).
+* Use `tl.load` / `tl.store` and column masking.
+* **Autotune** with multiple configs.
+
+**Allowed imports**: `torch`, `triton`, `triton.language`, `math`.
+
+**Signature skeleton**
+
+```python
+import torch, math
+import triton
+import triton.language as tl
+
+@triton.autotune(
+    # YOUR CONFIGS HERE
+)
+@triton.jit
+def _quantize_rowwise(x_ptr, output_ptr, output_maxs, n_elements,
+                      BLOCK_SIZE: tl.constexpr, P2: tl.constexpr):
+    # YOUR CODE HERE
+
+
+def quantize_rowwise(x: torch.Tensor):
+    # YOUR CODE HERE
+```
+
+---
+
+### 12) `12_matmul_int8_fused_dequant` — INT8 MatMul + Fused Dequant & Bias — **4.0 pts, up to 50 attempts**
+
+**Inputs**
+
+* `X_q: (B, IN)` — int8 activations
+* `W_q: (IN, OUT)` — int8 weights
+* `s_x` — fp32 scalar scale (per-tensor for inputs)
+* `s_w` — fp32 scales for weights: either scalar (per-tensor) or vector `(OUT,)` (per-OUT-channel)
+* `bias` — optional fp16 vector `(OUT,)`
+
+**Output**: `Y: (B, OUT)`, `fp16`.
+
+**Computation**
+
+1. Accumulate `int8 * int8` products into `int32`:
+   `ACC[b, o] = sum_k X_q[b, k] * W_q[k, o]`.
+2. Column scale: `alpha[o] = s_x * (s_w[o] if per-channel else s_w)`.
+3. After the `K` loop, produce: `Y[b, o] = fp16( fp32(ACC[b, o]) * alpha[o] + bias[o] )`.
+
+**Kernel**
+
+* Load int8 tiles of `X_q` and `W_q`, accumulate in `int32`.
+* Apply scaling **once after** the K-loop (fused dequant), add `bias` in-kernel, store `fp16`.
+* Support both per-channel and per-tensor weight scales via `PER_CHANNEL` constexpr flag.
+* Mask tails across `B`, `IN`, `OUT`.
+* **Autotune** with ≥3 configs (vary `BLOCK_M/N/K`, `num_warps`, `num_stages`).
+
+**Allowed imports**: `torch`, `triton`, `triton.language`.
+
+**Signature skeleton**
+
+```python
+import torch
+import triton
+import triton.language as tl
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_M": 64,  "BLOCK_N": 64,  "BLOCK_K": 64},  num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64,  "BLOCK_K": 64},  num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_M": 64,  "BLOCK_N": 128, "BLOCK_K": 64},  num_warps=4, num_stages=2)
+    ],
+    key=["B", "IN", "OUT"],
+)
+@triton.jit
+def _forward_int8_fused_kernel(x_q_ptr, x_scale_ptr,
+                               w_q_ptr, w_scale_ptr,
+                               b_ptr, y_ptr,
+                               B, IN, OUT,
+                               BLOCK_M: tl.constexpr,
+                               BLOCK_N: tl.constexpr,
+                               BLOCK_K: tl.constexpr,
+                               PER_CHANNEL: tl.constexpr):
+    # YOUR CODE HERE
+
+
+def matmul_int8_fused(x_q: torch.Tensor,
+                      x_scale: torch.Tensor,
+                      w_q: torch.Tensor,
+                      w_scale: torch.Tensor,
+                      bias: torch.Tensor | None = None,
+                      *, per_channel: bool = True) -> torch.Tensor:
+    """Return Y = dequant(X_q) @ dequant(W_q) + bias, dtype fp16, shape (B, OUT)."""
+    # YOUR CODE HERE
+```
+
+---
+
+### 13) `13_quantize_global_transpose_int8` — Global INT8 Quantize **+ Transpose** (Triton) — **2.0 pts, up to 50 attempts**
+
+**Goal**: For 2D `X[M, N]` (fp16/fp32), compute `absmax = max(|X|)`, quantize `Q = round(127*X/denom)`, and **store transposed** into `B[N, M]` (`int8`). Return `(B, absmax_fp32[1])`. Use `denom = max(absmax, 127*1e-8)` to avoid division by zero; return **original** `absmax`.
+
+**Kernel**
+
+* One kernel that loads tiles from `A (X)`, quantizes, and writes into `B` with transposed indices.
+* Use `tl.load` / `tl.store` and edge masking.
+* Support compatible strides: each tensor must have at least one unit-stride dimension.
+* **Autotune** with ≥3 configs (`BLOCK_M/N`, `GROUP_M`, and different warps/stages).
+
+**Allowed imports**: `torch`, `triton`, `triton.language`.
+
+**Signature skeleton**
+
+```python
+import torch
+import triton
+import triton.language as tl
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "GROUP_M": 8}, num_warps=4),
+        triton.Config({"BLOCK_M": 64,  "BLOCK_N": 128, "GROUP_M": 8}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64,  "GROUP_M": 8}, num_warps=4, num_stages=2)
+    ],
+    key=["M", "N"],
+)
+@triton.jit
+def _quantize_global_transpose(A, absmax_inv_ptr, B,
+                              stride_am, stride_an,
+                              stride_bn, stride_bm,
+                              M, N,
+                              BLOCK_M: tl.constexpr,
+                              BLOCK_N: tl.constexpr,
+                              GROUP_M: tl.constexpr):
+    # YOUR CODE HERE
+
+
+def quantize_global_transpose(x: torch.Tensor):
+    """Return (q_T:int8[N,M], absmax:fp32[1])."""
+    # YOUR CODE HERE
+```
+
+---
+
+### 14) `14_backward_dx_int8_fused` — INT8 Backward dX with Fused Dequant (Triton) — **3.5 pts, up to 50 attempts**
+
+**Goal**: Compute `dX = dY @ (dequant(W_q))^T` with accumulation in `fp32` and output in `fp16`.
+
+**Inputs**
+
+* `dY: (B, OUT)` — `fp16`
+* `W_q: (IN, OUT)` — `int8`
+* `s_w` — weight scales: scalar (per-tensor) or vector `(OUT,)` (per-OUT-channel)
+
+**Computation**
+
+* `W_q_deq[:, o] = W_q[:, o] * s_w[o]` (or `* s_w_scalar`)
+* `dX[b, i] = sum_k dY[b, k] * W_q_deq[i, k]`
+
+**Kernel**
+
+* Load `dY` tiles (`fp16`) and `W_q` tiles (`int8`), accumulate in `fp32`.
+* Apply weight scales once per tile (either inside the K-loop or right after, but not redundantly per partial sum).
+* Mask tails in all dimensions.
+* **Autotune** with ≥3 configs; support `PER_CHANNEL` constexpr flag.
+
+**Allowed imports**: `torch`, `triton`, `triton.language`.
+
+**Signature skeleton**
+
+```python
+import torch
+import triton
+import triton.language as tl
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_M": 64,  "BLOCK_N": 64,  "BLOCK_K": 64},  num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64,  "BLOCK_K": 64},  num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_M": 64,  "BLOCK_N": 128, "BLOCK_K": 64},  num_warps=4, num_stages=2)
+    ],
+    key=["B", "IN", "OUT"],
+)
+@triton.jit
+def _backward_dx_fused_kernel(dy_ptr, wq_ptr, w_scale_ptr, dx_ptr,
+                              B, IN, OUT,
+                              BLOCK_M: tl.constexpr,
+                              BLOCK_N: tl.constexpr,
+                              BLOCK_K: tl.constexpr,
+                              PER_CHANNEL: tl.constexpr):
+    # YOUR CODE HERE
+
+
+def backward_dx_int8_fused(dy: torch.Tensor,
+                           w_q: torch.Tensor,
+                           w_scale: torch.Tensor,
+                           *, per_channel: bool = True) -> torch.Tensor:
+    """Return dX = dY @ (dequant(W_q))^T, dtype fp16, shape (B, IN)."""
+    # YOUR CODE HERE
+```
+
+---
+
+
+* [ ] Outputs have correct dtypes and shapes
+* [ ] Passes public tests (or as many as possible)
+
+Good luck and have fun with Triton! 🚀
