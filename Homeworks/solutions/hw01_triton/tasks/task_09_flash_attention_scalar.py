@@ -33,40 +33,51 @@ import triton.language as tl
 
 
 @triton.jit
-def _flashatt_kernel(q_ptr, k_ptr, v_ptr, out_ptr, T, B1: tl.constexpr):
+def _flashatt_kernel(q_ptr, k_ptr, v_ptr, out_ptr, T, B0: tl.constexpr, B1: tl.constexpr):
     # Streaming softmax with running max / renormalization over tiles
     LOG2E = 1.4426950408889634  # log2(e)
 
-    # Pass 1: compute running max (m) and denominator (l)
-    m = -float("inf")
-    l = tl.zeros((), dtype=tl.float32)
+    # Indices for a block of queries (rows i)
+    pid = tl.program_id(0)
+    offs_i = pid * B0 + tl.arange(0, B0)
+    mask_i = offs_i < T
 
+    # Load queries for this block
+    q_i = tl.load(q_ptr + offs_i, mask=mask_i, other=0.0)  # [B0]
+
+    # Running stats per query in the block
+    m = tl.full((B0,), -float("inf"), dtype=tl.float32)  # [B0]
+    l = tl.zeros((B0,), dtype=tl.float32)                # [B0]
+    acc = tl.zeros((B0,), dtype=tl.float32)              # [B0]
+
+    # Iterate over keys/values in tiles of size B1 (columns j)
     for start in range(0, T, B1):
-        offs = start + tl.arange(0, B1)
-        mask = offs < T
+        offs_j = start + tl.arange(0, B1)               # [B1]
+        mask_j = offs_j < T
 
-        q_tile = tl.load(q_ptr + offs, mask=mask, other=0.0)
-        k_tile = tl.load(k_ptr + offs, mask=mask, other=0.0)
-        s_tile = q_tile * k_tile
+        k_j = tl.load(k_ptr + offs_j, mask=mask_j, other=0.0)  # [B1]
+        v_j = tl.load(v_ptr + offs_j, mask=mask_j, other=0.0)  # [B1]
 
-        tile_max = tl.max(tl.where(mask, s_tile, -float("inf")), axis=0)
-        m_new = tl.maximum(m, tile_max)
-        alpha = tl.exp2((m - m_new) * LOG2E)
-        exps = tl.where(mask, tl.exp2((s_tile - m_new) * LOG2E), 0.0)
-        l = l * alpha + tl.sum(exps, axis=0)
+        # Scores s[i,j] = q[i] * k[j]
+        s = q_i[:, None] * k_j[None, :]                         # [B0, B1]
+        valid = mask_i[:, None] & mask_j[None, :]
+
+        # Update running max per row
+        tile_max = tl.max(tl.where(valid, s, -float("inf")), axis=1)  # [B0]
+        m_new = tl.maximum(m, tile_max)                                # [B0]
+        alpha = tl.exp2((m - m_new) * LOG2E)                           # [B0]
+
+        # Exponentials for this tile
+        exps = tl.where(valid, tl.exp2((s - m_new[:, None]) * LOG2E), 0.0)  # [B0, B1]
+
+        # Update denominator and numerator
+        l = l * alpha + tl.sum(exps, axis=1)
+        acc = acc * alpha + tl.sum(exps * v_j[None, :], axis=1)
         m = m_new
 
-    # Pass 2: write per-element softmax(s) * v to out
-    for start in range(0, T, B1):
-        offs = start + tl.arange(0, B1)
-        mask = offs < T
-        q_tile = tl.load(q_ptr + offs, mask=mask, other=0.0)
-        k_tile = tl.load(k_ptr + offs, mask=mask, other=0.0)
-        v_tile = tl.load(v_ptr + offs, mask=mask, other=0.0)
-        s_tile = q_tile * k_tile
-        weights = tl.where(mask, tl.exp2((s_tile - m) * LOG2E) / l, 0.0)
-        out_vals = weights * v_tile
-        tl.store(out_ptr + offs, out_vals, mask=mask)
+    # Final output per query: acc / l
+    out_i = acc / l
+    tl.store(out_ptr + offs_i, out_i, mask=mask_i)
 
 
 def flashatt_triton(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
@@ -74,10 +85,11 @@ def flashatt_triton(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.
     assert q.dim() == 1 and k.dim() == 1 and v.dim() == 1
     T = q.numel()
     assert k.numel() == T and v.numel() == T
+    B0 = 128
     B1 = 128
     out = torch.empty(T, device=q.device, dtype=q.dtype)
-    grid = (1,)
-    _flashatt_kernel[grid](q, k, v, out, T, B1)
+    grid = (triton.cdiv(T, B0),)
+    _flashatt_kernel[grid](q, k, v, out, T, B0, B1)
     return out
 
 
@@ -93,10 +105,10 @@ if __name__ == "__main__":
 
     out = flashatt_triton(q, k, v)
 
-    # PyTorch reference vectors
-    s = q * k
-    weights = torch.softmax(s, dim=0)
-    ref_vec = weights * v
+    # PyTorch reference: out[i] = sum_j softmax(q[i]*k[j]) * v[j]
+    s = q[:, None] * k[None, :]
+    weights = torch.softmax(s, dim=1)
+    ref_vec = (weights * v[None, :]).sum(dim=1)
 
     max_err = (out - ref_vec).abs().max().item()
     print("out[:8]", out[:8])
