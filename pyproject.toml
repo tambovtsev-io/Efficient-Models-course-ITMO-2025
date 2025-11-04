@@ -1,14 +1,14 @@
 [project]
-name = "hw01-triton"
+name = "efficient-models-course-itmo-2025"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "ipykernel>=6.30.1",
+    "ipykernel>=7.1.0",
     "jupyter>=1.1.1",
-    "jupytext>=1.17.3",
-    "numpy>=2.3.3",
-    "torch>=2.8.0",
-    "triton>=3.4.0",
+    "matplotlib>=3.10.7",
+    "numpy>=2.3.4",
+    "seaborn>=0.13.2",
+    "tqdm>=4.67.1",
 ]
